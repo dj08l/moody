@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moody </title>
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <script type="module">
+        // --- Firebase Imports ---
+        import {
+    getFirestore,
+    doc,
+    addDoc,
+    onSnapshot,
+    collection,
+    query,
+    limit,
+    orderBy,
+    setLogLevel
+} from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Set Firebase Log Level
+        setLogLevel('debug');
+        
+        
+
+
+        // --- Global Variables (Provided by Canvas Environment) ---
+       // ------------- YOUR FIREBASE CONFIG HERE -------------
+const appId = 'moody-local-app';
+
+// Get this config from Firebase Console → Project Settings → Web app
+const firebaseConfig = {
+  apiKey: "14735df9333d14662dd85906655ad4bddac7c817",
+  authDomain: "moody-c9a07.firebaseapp.com",
+  projectId: "moody-c9a07",
+  storageBucket: "moody-c9a07.appspot.com",
+  messagingSenderId: "586758721916",
+  appId: "1:586758721916:web:252e19b95d349ed05394f9"
+};
+
+const initialAuthToken = null; // not using custom token locally
+ // API key for Gemini API is provided by the Canvas environment if needed
+
+        let db, auth, userId = null;
+        let logInterval = null; // Timer for logging mood
+        let moodHistory = []; // Local cache of mood logs
+
+        // State for keystroke tracking
+        let tracker = {
+            totalKeys: 0, errorKeys: 0, startTime: Date.now(),
+            lastKeyPressTime: Date.now(), typingActive: false, textLength: 0
+        };
+
+        // State for AV Mood Simulation
+        let simulatedAvMood = "NEUTRAL";
+        let micStream = null;
+        let cameraStream = null;
+
+        // Mood Mapping adjusted to fit the Java MoodAnalyzer: SAD, STRESSED, NEUTRAL, HAPPY
+        const MOODS = [
+            { name: "SAD", score: 1, color: 'bg-red-500' },
+            { name: "STRESSED", score: 3, color: 'bg-orange-500' },
+            { name: "NEUTRAL", score: 4, color: 'bg-blue-400' },
+            { name: "HAPPY", score: 5, color: 'bg-green-500' },
+        ];
+        
+        const getMoodData = (moodName) => MOODS.find(m => m.name === moodName) || MOODS[2]; // Default to NEUTRAL
+
+        // --- Firebase Initialization and Authentication ---
+
+        const initFirebase = async () => {
+            if (!firebaseConfig) {
+                console.error("Firebase config is missing.");
+                document.getElementById('status').textContent = "Error: Firebase configuration missing.";
+                return;
+            }
+
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Authenticate user
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('status').textContent = `Authenticated. User ID: ${userId}`;
+                        document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                        startSystem();
+                    } else {
+                        console.log("No user signed in.");
+                        document.getElementById('status').textContent = "Authentication failed.";
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                document.getElementById('status').textContent = `Error: ${error.message}`;
+            }
+        };
+
+        // --- Firestore Data Paths ---
+
+        const getMoodCollectionRef = () => {
+            if (!userId) {
+                console.error("User ID is not set. Cannot get collection reference.");
+                return null;
+            }
+            // Private data storage path: /artifacts/{appId}/users/{userId}/mood_logs
+            const path = `artifacts/${appId}/users/${userId}/mood_logs`;
+            return collection(db, path);
+        };
+
+        // --- Keystroke Tracking Logic ---
+
+        const updateKeystrokeTracker = (event) => {
+            const now = Date.now();
+            tracker.lastKeyPressTime = now;
+            
+            if (!tracker.typingActive) {
+                tracker.typingActive = true;
+                tracker.startTime = now;
+                tracker.totalKeys = 0;
+                tracker.errorKeys = 0;
+            }
+
+            if (event.type === 'keydown') {
+                tracker.totalKeys++;
+                if (event.key === 'Backspace') {
+                    tracker.errorKeys++;
+                }
+            }
+            
+            tracker.textLength = document.getElementById('typing-input').value.length;
+            detectAndDisplayMood();
+        };
+
+        // --- Mood Detection (Implementing Keystroke & Combination Logic) ---
+
+        const detectKeystrokeMood = () => {
+            const now = Date.now();
+            const elapsedTimeSeconds = (now - tracker.startTime) / 1000;
+            const idleTimeMs = now - tracker.lastKeyPressTime;
+            
+            const avgSpeed = elapsedTimeSeconds > 0 ? (tracker.textLength / elapsedTimeSeconds) * 60 : 0;
+            const errorCount = tracker.errorKeys;
+
+            let detectedMoodName;
+
+            // Keystroke MoodAnalyzer logic
+            if (idleTimeMs > 300000) { // > 5 minutes idle
+                detectedMoodName = "SAD";
+            } else if (avgSpeed > 250 && errorCount > 10) {
+                detectedMoodName = "STRESSED";
+            } else if (avgSpeed > 150) {
+                detectedMoodName = "HAPPY";
+            } else {
+                detectedMoodName = "NEUTRAL";
+            }
+            
+            return {
+                name: detectedMoodName,
+                speed: Math.round(avgSpeed),
+                errors: errorCount,
+                idle: Math.round(idleTimeMs / 1000) // Convert to seconds
+            };
+        };
+        
+        // --- Java MoodAnalyzer.combineSignals logic ---
+        const combineSignals = (keystrokeMoodName, avMoodName) => {
+            if (keystrokeMoodName === "STRESSED" || avMoodName === "STRESSED") {
+                return "STRESSED";
+            }
+            if (keystrokeMoodName === "SAD" || avMoodName === "SAD") {
+                return "SAD";
+            }
+            // If one is NEUTRAL, return the other. If both are HAPPY/NEUTRAL, return the higher (HAPPY is score 5, NEUTRAL is 4)
+            if (keystrokeMoodName !== "NEUTRAL") return keystrokeMoodName;
+            return avMoodName;
+        };
+        
+        // --- Media Access & Status ---
+
+        const toggleMedia = async (type) => {
+            const videoElement = document.getElementById('camera-stream');
+            const button = document.getElementById(type + '-toggle');
+            const indicator = document.getElementById(type + '-status');
+
+            // Determine primary and disabled color classes based on the new theme
+            const primaryColor = 'bg-emerald-600';
+            const hoverColor = 'hover:bg-emerald-700';
+            const disabledColor = 'bg-gray-500';
+
+            if (type === 'camera' && cameraStream) {
+                cameraStream.getTracks().forEach(track => track.stop());
+                videoElement.srcObject = null;
+                cameraStream = null;
+                indicator.className = 'text-red-500';
+                button.textContent = 'Enable Camera';
+                button.classList.remove(disabledColor);
+                button.classList.add(primaryColor, hoverColor);
+                return;
+            } else if (type === 'mic' && micStream) {
+                micStream.getTracks().forEach(track => track.stop());
+                micStream = null;
+                indicator.className = 'text-red-500';
+                button.textContent = 'Enable Microphone';
+                button.classList.remove(disabledColor);
+                button.classList.add(primaryColor, hoverColor);
+                return;
+            }
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: type === 'camera', 
+                    audio: type === 'mic' 
+                });
+
+                if (type === 'camera') {
+                    cameraStream = stream;
+                    videoElement.srcObject = stream;
+                    videoElement.play();
+                } else {
+                    micStream = stream;
+                }
+                
+                indicator.className = 'text-green-500';
+                button.textContent = 'Disable ' + (type === 'camera' ? 'Camera' : 'Microphone');
+                button.classList.remove(primaryColor, hoverColor);
+                button.classList.add(disabledColor);
+
+            } catch (err) {
+                console.error("Error accessing media:", err);
+                
+                let message = `Could not access ${type}. Please check permissions.`;
+
+                // Enhanced error handling to address user-dismissed permissions
+                if (err.name === 'NotAllowedError' || err.message.includes('dismissed')) {
+                    message = `Media access denied. Please click the 'Enable' button and allow camera/microphone access in your browser settings and try again.`;
+                } else if (err.name === 'NotFoundError') {
+                    message = `No ${type} device found on your system.`;
+                }
+
+                showMessageBox('Media Access Error', message, 'error');
+                indicator.className = 'text-red-500';
+            }
+        };
+
+        // --- Text Mood Analysis (Gemini API Integration) ---
+
+        const analyzeTextMood = async () => {
+            const storyText = document.getElementById('story-input').value.trim();
+            const analyzeButton = document.getElementById('analyze-text-button');
+            const moodDisplay = document.getElementById('text-mood-display');
+            const nameDisplay = document.getElementById('suggested-name-display');
+
+            if (!storyText) {
+                showMessageBox('Input Required', 'Please enter some text in the story/chat input area for mood analysis.', 'info');
+                return;
+            }
+
+            analyzeButton.textContent = 'Analyzing...';
+            analyzeButton.disabled = true;
+            moodDisplay.textContent = 'Analyzing...';
+            nameDisplay.textContent = 'Analyzing...';
+
+            const systemPrompt = "You are a specialized Text Mood Analyzer and Codename Generator. Analyze the provided text for its dominant emotional tone. Then, generate a creative, single-word codename/alias that reflects that mood. Your entire response MUST be formatted strictly as: MOOD: [Detected Mood, e.g., 'Anxiety', 'Joy', 'Melancholy', 'Frustration'] | CODENAME: [Creative Codename, e.g., 'Zenith', 'Shadow', 'Tempest'].";
+            const userQuery = `Analyze the mood of the following text: "${storyText}"`;
+            
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                tools: [{ "google_search": {} }],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+            };
+            
+            let responseText = "MOOD: Neutral | CODENAME: Echo"; // Default Fallback
+
+            // Exponential Backoff Implementation
+            const maxRetries = 5;
+            let delay = 1000;
+            
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.ok) {
+                        const result = await response.json();
+                        responseText = result.candidates?.[0]?.content?.parts?.[0]?.text || responseText;
+                        break; 
+                    } else if (response.status === 429 && i < maxRetries - 1) {
+                        // Too Many Requests, retry
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        delay *= 2;
+                    } else {
+                        throw new Error(`API returned status ${response.status}`);
+                    }
+                } catch (error) {
+                    console.error("Gemini API call failed:", error);
+                    responseText = `MOOD: Error | CODENAME: Silent`;
+                    break;
+                }
+            }
+            
+            // Parse the standardized response
+            const moodMatch = responseText.match(/MOOD:\s*(.*?)\s*\|/i);
+            const nameMatch = responseText.match(/CODENAME:\s*(.*)/i);
+            
+            const detectedMood = moodMatch ? moodMatch[1].trim() : 'Undetermined';
+            const suggestedName = nameMatch ? nameMatch[1].trim() : '—'; // Set fallback to dash
+
+            // Update UI
+            moodDisplay.textContent = `Textual Mood: ${detectedMood}`;
+            nameDisplay.textContent = suggestedName;
+            
+            analyzeButton.textContent = 'Analyze Text Mood';
+            analyzeButton.disabled = false;
+        };
+
+
+        // --- Core Logic: Mood Logging ---
+
+        const logCurrentMood = async () => {
+            const keystrokeResult = detectKeystrokeMood();
+            const combinedMoodName = combineSignals(keystrokeResult.name, simulatedAvMood);
+            const selectedMood = getMoodData(combinedMoodName);
+            const timestamp = new Date();
+
+            const logEntry = {
+                timestamp: timestamp.toISOString(),
+                moodName: selectedMood.name,
+                moodScore: selectedMood.score,
+                keystrokeSpeed: keystrokeResult.speed,
+                keystrokeErrors: keystrokeResult.errors,
+                keystrokeIdleTimeS: keystrokeResult.idle,
+                avSimulatedMood: simulatedAvMood, // Log the simulated AV mood for context
+                context: "Combined Keystroke & Simulated AV Data",
+            };
+
+            try {
+                const colRef = getMoodCollectionRef();
+                if (colRef) {
+                    await addDoc(colRef, logEntry);
+                    console.log("Mood logged successfully:", logEntry.moodName);
+                    checkAndShowNudge();
+                }
+            } catch (error) {
+                console.error("Error logging mood:", error);
+                showMessageBox('Error Logging Data', `Failed to log mood to database. Error: ${error.message}`, 'error');
+            }
+        };
+
+        // --- Real-time Nudge System (Decision Layer) ---
+
+        const checkAndShowNudge = () => {
+            // Check for a streak of 3 or more negative (score < 3: SAD or STRESSED) moods in the last 5 logs
+            const negativeStreak = moodHistory.slice(0, 5).filter(log => log.moodScore < 3);
+
+            if (negativeStreak.length >= 3) {
+                const nudgeOptions = [
+                    "A pattern of digital loneliness detected. Close the screen and try a short walk.",
+                    "Prolonged stress detected. It might be a good time to call a friend or loved one.",
+                    "A sequence of low moods detected. Try journaling your feelings away from the keyboard.",
+                    "Feeling drained? Remember to pause your work and connect with a trusted person."
+                ];
+                const nudgeMessage = nudgeOptions[Math.floor(Math.random() * nudgeOptions.length)];
+
+                const nudgeElement = document.getElementById('nudge-alert');
+                document.getElementById('nudge-message').textContent = nudgeMessage;
+                nudgeElement.classList.remove('hidden');
+
+                setTimeout(() => nudgeElement.classList.add('hidden'), 15000);
+            }
+        };
+
+        // --- Emotional Trend Dashboard (Visualization) ---
+const subscribeToMoodLogs = () => {
+    const colRef = getMoodCollectionRef();
+    if (!colRef) return;
+
+    const q = query(colRef, orderBy("timestamp", "desc"), limit(10));
+
+    onSnapshot(q, (snapshot) => {
+        moodHistory = [];
+        snapshot.forEach((doc) => {
+            moodHistory.push(doc.data());
+        });
+
+        renderDashboard();
+    }, (error) => {
+        console.error("Error subscribing to mood logs:", error);
+        showMessageBox('Data Error', 'Could not load emotional trend data.', 'error');
+    });
+};
+
+        
+
+        const renderDashboard = () => {
+            const dashboardContainer = document.getElementById('dashboard-logs');
+            dashboardContainer.innerHTML = ''; 
+
+            if (moodHistory.length === 0) {
+                dashboardContainer.innerHTML = '<p class="text-gray-500 italic">No mood logs yet. Start typing to see the analysis!</p>';
+                return;
+            }
+
+            moodHistory.forEach((log) => {
+                const moodData = getMoodData(log.moodName);
+                const moodColor = moodData ? moodData.color : 'bg-gray-400';
+                const time = new Date(log.timestamp).toLocaleTimeString();
+                const barWidth = (log.moodScore / 5) * 100; 
+
+                const speed = log.keystrokeSpeed || 'N/A';
+                const av = log.avSimulatedMood || 'N/A';
+
+                const logItem = `
+                    <div class="flex items-center space-x-2 py-1 group hover:bg-gray-50 rounded-md px-1 transition-all">
+                        <span class="text-sm font-mono text-gray-500 w-16 flex-shrink-0">${time}</span>
+                        <div class="relative w-full h-6 rounded-lg overflow-hidden bg-gray-200 shadow-inner">
+                            <div style="width: ${barWidth}%;" class="h-full ${moodColor} transition-all duration-500 flex items-center justify-end pr-2">
+                                <span class="text-xs font-bold text-white uppercase">${log.moodName}</span>
+                            </div>
+                        </div>
+                        <span class="text-xs text-gray-700 w-24 flex-shrink-0">AV: ${av}</span>
+                    </div>
+                `;
+                dashboardContainer.innerHTML += logItem;
+            });
+        };
+
+        // --- UI Event Handlers and Helpers ---
+
+        const detectAndDisplayMood = () => {
+            const keystrokeResult = detectKeystrokeMood();
+            const combinedMoodName = combineSignals(keystrokeResult.name, simulatedAvMood);
+            const moodData = getMoodData(combinedMoodName);
+
+            const display = document.getElementById('current-mood-display');
+            const metrics = document.getElementById('metrics-display');
+            const keystrokeDisplay = document.getElementById('keystroke-mood-display');
+            const suggestionDisplay = document.getElementById('real-time-suggestion');
+            
+            // 1. Get real-time suggestion based on the *current* COMBINED mood state
+            const currentSuggestion = getSuggestion(combinedMoodName);
+
+            // 2. Update Suggestion Display
+            suggestionDisplay.textContent = currentSuggestion;
+            suggestionDisplay.className = `p-3 rounded-lg text-center font-medium shadow-md ${combinedMoodName === 'SAD' || combinedMoodName === 'STRESSED' ? 'bg-red-100 text-red-800 border-red-300' : 'bg-green-100 text-green-800 border-green-300'} border transition-colors duration-300`;
+
+            // 3. Update Keystroke Component Display
+            keystrokeDisplay.textContent = `Keystroke Mood: ${keystrokeResult.name}`;
+            keystrokeDisplay.className = `text-sm font-semibold p-2 rounded-lg bg-gray-200 text-gray-700 w-full text-center`;
+
+            // 4. Update Combined Mood Display
+            display.textContent = `Final Combined Mood: ${moodData.name}`;
+            display.className = `text-xl font-extrabold p-4 rounded-xl ${moodData.color} text-white transition-colors duration-300 shadow-xl w-full text-center`;
+
+            // 5. Update Metrics Display
+            metrics.innerHTML = `
+                <div class="flex flex-col items-center">
+                    <span class="text-2xl font-bold text-emerald-600">${keystrokeResult.speed}</span>
+                    <span class="text-xs text-gray-500">Avg Speed (CPM)</span>
+                </div>
+                <div class="flex flex-col items-center">
+                    <span class="text-2xl font-bold text-red-600">${keystrokeResult.errors}</span>
+                    <span class="text-xs text-gray-500">Error Count</span>
+                </div>
+                <div class="flex flex-col items-center">
+                    <span class="text-2xl font-bold text-gray-600">${keystrokeResult.idle}s</span>
+                    <span class="text-xs text-gray-500">Idle Time</span>
+                </div>
+            `;
+        };
+        
+        // --- Suggestion Engine ---
+        const getSuggestion = (moodName) => {
+            switch (moodName) {
+                case "STRESSED":
+                    return "You seem stressed. Take a 5-minute break or try deep breathing.";
+                case "SAD":
+                    return "You seem low. Maybe talk to a close friend or write down your thoughts.";
+                case "HAPPY":
+                    return "You're in a good mood! Keep going, but remember to rest your eyes.";
+                case "NEUTRAL":
+                default:
+                    return "You're doing fine. Stay hydrated and keep a healthy pace.";
+            }
+        }
+
+        const handleAvMoodChange = (event) => {
+            simulatedAvMood = event.target.value;
+            document.getElementById('simulated-av-display').textContent = `Simulated AV Mood: ${simulatedAvMood}`;
+            detectAndDisplayMood(); // Recalculate combined mood immediately
+        }
+
+
+        const setupEventListeners = () => {
+            const typingInput = document.getElementById('typing-input');
+            typingInput.addEventListener('keydown', updateKeystrokeTracker);
+            typingInput.addEventListener('keyup', updateKeystrokeTracker);
+            
+            document.getElementById('log-mood-button').addEventListener('click', logCurrentMood);
+            document.getElementById('camera-toggle').addEventListener('click', () => toggleMedia('camera'));
+            document.getElementById('mic-toggle').addEventListener('click', () => toggleMedia('mic'));
+            document.getElementById('av-mood-select').addEventListener('change', handleAvMoodChange);
+            document.getElementById('analyze-text-button').addEventListener('click', analyzeTextMood); // Added new event listener
+        };
+
+        // Custom Modal Message Box (No alert/confirm)
+        const showMessageBox = (title, message, type = 'info') => {
+            const modal = document.getElementById('custom-modal');
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-message').textContent = message;
+
+            const iconClass = type === 'error' ? 'text-red-500' : 'text-blue-500';
+            document.getElementById('modal-icon').className = `text-4xl ${iconClass}`;
+            document.getElementById('modal-icon').textContent = type === 'error' ? '🚫' : '💡';
+
+            modal.classList.remove('hidden');
+        };
+
+        // --- System Start ---
+
+        const startSystem = () => {
+            detectAndDisplayMood(); 
+            subscribeToMoodLogs(); 
+
+            logInterval = setInterval(() => {
+                logCurrentMood();
+            }, 30000); // Logs every 30 seconds
+
+            setupEventListeners();
+        };
+
+        // Initialize on window load
+        window.onload = initFirebase;
+    </script>
+    <style>
+        /* Changed background to a soft gray-blue for a calmer feel */
+        body { font-family: 'Inter', sans-serif; background-color: #f1f5f9; /* equivalent to slate-100 */ }
+        .card { background-color: white; border-radius: 1rem; box-shadow: 0 6px 10px rgba(0, 0, 0, 0.05); }
+        .stream-window {
+            width: 100%;
+            height: 150px;
+            background-color: #333;
+            border-radius: 0.75rem;
+            overflow: hidden;
+        }
+        #camera-stream {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1); /* Mirror effect for webcam */
+        }
+    </style>
+</head>
+<body class="p-4 md:p-8 min-h-screen bg-slate-50">
+
+    <div class="max-w-6xl mx-auto">
+        <header class="text-center mb-8">
+            <!-- Updated header color to friendly emerald -->
+            <h1 class="text-4xl font-extrabold text-emerald-700">Moody Assistant</h1>
+            <p class="text-lg text-gray-500">Digital Loneliness & Well-being Tracker (Text & AV Enhanced)</p>
+            <p id="user-id-display" class="text-xs text-gray-400 mt-1">User ID: N/A</p>
+        </header>
+
+        <!-- Nudge Alert: Updated color to emerald -->
+        <div id="nudge-alert" class="hidden fixed top-4 right-4 bg-emerald-500 text-white p-4 rounded-lg shadow-2xl z-50 transition-all duration-300 transform scale-100 hover:scale-[1.02] cursor-pointer">
+            <span class="font-bold">Moody Notification</span>
+            <p id="nudge-message" class="text-sm mt-1"></p>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+
+            <!-- Real-Time Monitoring & Input Card (Span 2 columns) -->
+            <div class="lg:col-span-2 card p-6">
+                <h2 class="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Real-Time Mood Detection (Keystroke + AV Fusion)</h2>
+
+                <!-- Status Indicator: Updated color to emerald -->
+                <p id="status" class="text-sm mb-4 text-center p-2 bg-emerald-100 text-emerald-800 rounded-lg">Connecting to Firebase...</p>
+
+                <div class="space-y-6">
+                    
+                    <!-- Media Controls and Status -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="space-y-2">
+                            <h3 class="text-base font-semibold text-gray-700 flex items-center">
+                                Camera/Face Status: <span id="camera-status" class="ml-2 text-red-500">●</span>
+                            </h3>
+                            <div class="stream-window">
+                                <video id="camera-stream" autoplay playsinline muted></video>
+                            </div>
+                            <!-- Updated button color to emerald -->
+                            <button id="camera-toggle" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold py-2 rounded-lg transition">Enable Camera</button>
+                        </div>
+                        <div class="space-y-2">
+                            <h3 class="text-base font-semibold text-gray-700 flex items-center">
+                                Mic/Voice Status: <span id="mic-status" class="ml-2 text-red-500">●</span>
+                            </h3>
+                            <div class="p-3 bg-gray-50 h-[150px] rounded-lg border flex items-center justify-center flex-col">
+                                <p class="text-sm text-gray-500 mb-2">Simulated AV Result:</p>
+                                <select id="av-mood-select" class="p-2 border rounded-md text-sm">
+                                    <option value="NEUTRAL">NEUTRAL (Default)</option>
+                                    <option value="HAPPY">HAPPY (Simulated Smile/High Tone)</option>
+                                    <option value="STRESSED">STRESSED (Simulated Frown/Fast Speech)</option>
+                                    <option value="SAD">SAD (Simulated Flat Expression/Low Tone)</option>
+                                </select>
+                                <p id="simulated-av-display" class="text-xs text-gray-500 mt-2">Simulated AV Mood: NEUTRAL</p>
+                            </div>
+                            <!-- Updated button color to emerald -->
+                            <button id="mic-toggle" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold py-2 rounded-lg transition">Enable Microphone</button>
+                        </div>
+                    </div>
+
+                    <!-- Mood Component Breakdown -->
+                    <div class="pt-4 border-t">
+                        <div class="flex justify-between items-center space-x-4 mb-4">
+                            <p id="keystroke-mood-display" class="text-sm font-semibold p-2 rounded-lg bg-gray-200 text-gray-700 w-1/2 text-center">Keystroke Mood: NEUTRAL</p>
+                            <div id="current-mood-display" class="text-xl font-extrabold p-4 rounded-xl bg-blue-400 text-white shadow-xl w-1/2 text-center">
+                                Final Combined Mood: NEUTRAL
+                            </div>
+                        </div>
+                    </div>
+
+
+                    <!-- Real-Time Suggestion Display (Suggestion Engine) -->
+                    <div id="suggestion-wrapper">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-2 mt-4">Moody Suggestion</h3>
+                        <p id="real-time-suggestion" class="p-3 rounded-lg text-center font-medium shadow-md bg-green-100 text-green-800 border border-green-300">
+                            You're doing fine. Stay hydrated and keep a healthy pace.
+                        </p>
+                    </div>
+
+                    <!-- Keystroke Metrics Display -->
+                    <div class="border-t pt-4">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-4">Keystroke Metrics Analyzed:</h3>
+                        <div id="metrics-display" class="flex justify-around items-center bg-gray-50 p-4 rounded-lg border">
+                            <!-- Metric text color updated to emerald -->
+                            <!-- Metrics will be dynamically updated here -->
+                        </div>
+                    </div>
+
+
+                    <!-- Keystroke Dynamics (Typing Pattern Input) -->
+                    <div>
+                        <h3 class="text-xl font-semibold text-gray-800 mb-2">Typing Input Area (To drive Keystroke Mood)</h3>
+                        <!-- Updated focus ring color to emerald -->
+                        <textarea id="typing-input" rows="3" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-emerald-500 focus:border-emerald-500" placeholder="Type here to drive the keystroke mood analysis. Try typing quickly/slowly or pausing for a few minutes to see the mood change!"></textarea>
+                        <p class="text-xs text-gray-500 mt-1">
+                            *Keystroke Rules: SAD (5+ min idle), STRESSED (250+ CPM & 10+ errors), HAPPY (150+ CPM, few errors).*
+                        </p>
+                    </div>
+
+                    <!-- Manual Log Button: Updated color to emerald -->
+                    <button id="log-mood-button" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3 px-4 rounded-lg transition duration-150 transform hover:scale-[1.01] shadow-md">
+                        Log Combined Mood & All Metrics
+                    </button>
+                </div>
+            </div>
+
+            <!-- Dashboard & Text Analysis Card (Span 1 column) -->
+            <div class="lg:col-span-1 space-y-8">
+                
+                <!-- Text Mood Analyzer Card: Updated color to sky -->
+                <div class="card p-6">
+                    <h2 class="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Text Mood Analyzer (Gemini AI)</h2>
+                    
+                    <!-- Updated focus ring color to sky -->
+                    <textarea id="story-input" rows="4" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-sky-500 focus:border-sky-500 mb-3" placeholder="Paste a chat snippet, story, or diary entry here..."></textarea>
+                    
+                    <!-- Updated button color to sky -->
+                    <button id="analyze-text-button" class="w-full bg-sky-600 hover:bg-sky-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-150 shadow-md mb-4">
+                        Analyze Text Mood
+                    </button>
+
+                    <div class="space-y-3">
+                        <!-- Updated result background and text colors to sky -->
+                        <div class="p-3 bg-sky-50 rounded-lg border border-sky-200">
+                            <p class="text-sm font-medium text-sky-700">Textual Mood:</p>
+                            <p id="text-mood-display" class="text-lg font-bold text-sky-800 mt-1">Ready for analysis...</p>
+                        </div>
+                        <div class="p-3 bg-gray-50 rounded-lg border">
+                            <p class="text-sm font-medium text-gray-700">Suggested Codename:</p>
+                            <p id="suggested-name-display" class="text-lg font-bold text-gray-800 mt-1">—</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Emotional Trend Dashboard -->
+                <div class="card p-6">
+                    <h2 class="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Emotional Trend Dashboard</h2>
+                    <p class="text-sm text-gray-500 mb-4">Last 10 combined mood logs (auto-updates via Firestore)</p>
+
+                    <div id="dashboard-logs" class="space-y-2 max-h-[400px] overflow-y-auto">
+                        <!-- Logs will be rendered here -->
+                        <div class="text-center text-gray-400">Loading trend data...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Modal for Alerts: Updated button color to emerald -->
+    <div id="custom-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-50 flex items-center justify-center z-[100]">
+        <div class="card p-6 w-full max-w-sm">
+            <div class="flex items-center space-x-4">
+                <span id="modal-icon">💡</span>
+                <div>
+                    <h3 id="modal-title" class="text-xl font-bold">Message</h3>
+                    <p id="modal-message" class="text-gray-600 mt-1 text-sm"></p>
+                </div>
+            </div>
+            <button onclick="document.getElementById('custom-modal').classList.add('hidden')" class="mt-4 w-full bg-emerald-600 text-white py-2 rounded-lg hover:bg-emerald-700 transition">
+                Close
+            </button>
+        </div>
+    </div>
+
+</body>
+</html>
